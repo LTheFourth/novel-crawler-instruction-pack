@@ -1,0 +1,187 @@
+({
+  domain: 'xtruyen.vn',
+  displayName: 'XTruyen',
+
+  _headers: {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Referer': 'https://www.xtruyen.vn/',
+    'Accept-Language': 'vi-VN,vi;q=0.9,en;q=0.8',
+  },
+
+  async search(query, page) {
+    const encoded = encodeURIComponent(query).replace(/%20/g, '+');
+    const url = page === 1
+      ? `https://www.xtruyen.vn/?s=${encoded}&post_type=wp-manga`
+      : `https://www.xtruyen.vn/?s=${encoded}&post_type=wp-manga&m_orderby=keywords&page=${page}`;
+    const html = await __http.get(url, this._headers);
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+
+    const results = [...doc.querySelectorAll('div.popular-item-wrap')]
+      .map(el => {
+        const anchor = el.querySelector('.popular-content h5.widget-title a');
+        const href = anchor?.getAttribute('href') ?? '';
+        if (!href) return null;
+        const slug = href.split('/truyen/')[1]?.replace(/\/$/, '') ?? '';
+        return {
+          id: slug,
+          title: anchor.textContent.trim(),
+          cover_url: el.querySelector('.popular-img img')?.getAttribute('src') ?? '',
+          source_url: href,
+        };
+      })
+      .filter(Boolean);
+
+    let totalPages = 1;
+    doc.querySelectorAll('.pagination .page-numbers').forEach(el => {
+      const n = parseInt(el.textContent.trim(), 10);
+      if (!isNaN(n) && n > totalPages) totalPages = n;
+    });
+
+    return { results, totalPages };
+  },
+
+  async fetchNovelDetail(slug) {
+    const BASE = 'https://www.xtruyen.vn';
+    const html = await __http.get(`${BASE}/truyen/${slug}/`, this._headers);
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+
+    // Extract post ID from #manga-chapters-holder data-id
+    const postId = doc.querySelector('#manga-chapters-holder')?.getAttribute('data-id') ?? '';
+
+    // Novel status
+    let status = 'ongoing';
+    doc.querySelectorAll('.post-content_item').forEach(item => {
+      const heading = item.querySelector('.summary-heading h3')?.textContent ?? '';
+      if (heading.includes('Trạng thái')) {
+        const text = item.querySelector('.summary-content')?.textContent ?? '';
+        if (text.includes('Hoàn')) status = 'complete';
+      }
+    });
+
+    const novel = {
+      id: slug,
+      title: doc.querySelector('.post-title h1')?.textContent.trim() ?? '',
+      cover_url: doc.querySelector('.summary_image img')?.getAttribute('src') ?? '',
+      source_url: `${BASE}/truyen/${slug}/`,
+      status,
+      source_domain: 'xtruyen.vn',
+    };
+
+    // Step 1: fetch chapter range groups
+    const rangesHtml = await __http.post(
+      `${BASE}/truyen/${slug}/ajax/chapters/`,
+      '',
+      { ...this._headers, 'X-Requested-With': 'XMLHttpRequest' }
+    );
+    const rangesDoc = new DOMParser().parseFromString(rangesHtml, 'text/html');
+
+    const ranges = [];
+    rangesDoc.querySelectorAll('li.has-child[data-value]').forEach(li => {
+      const val = li.getAttribute('data-value') ?? '';
+      const parts = val.split('-to-');
+      if (parts.length === 2) {
+        const from = parseInt(parts[0], 10);
+        const to = parseInt(parts[1], 10); // strips trailing 'm' via parseInt
+        if (!isNaN(from) && !isNaN(to)) ranges.push({ from, to });
+      }
+    });
+
+    // If no ranges found, try single range covering all
+    if (ranges.length === 0) ranges.push({ from: 1, to: 99999 });
+
+    // Step 2: fetch chapters per range
+    const allStubs = [];
+    const seen = new Set();
+    for (const range of ranges) {
+      try {
+        const body = `manga_id=${postId}&from=${range.from}&to=${range.to}`;
+        const json = await __http.post(
+          `${BASE}/api/api-chapters.php`,
+          body,
+          {
+            ...this._headers,
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-Custom-Auth': 'abC0000011111',
+            'Content-Type': 'application/x-www-form-urlencoded',
+          }
+        );
+        await new Promise(r => setTimeout(r, 300));
+        const chapters = JSON.parse(json);
+        for (const ch of chapters) {
+          const chSlug = ch.s ?? '';
+          if (!chSlug || seen.has(chSlug)) continue;
+          seen.add(chSlug);
+          const m = chSlug.match(/chuong-(\d+)/i);
+          allStubs.push({
+            id: `${slug}/${chSlug}`,
+            novel_id: slug,
+            number: m ? parseInt(m[1], 10) : allStubs.length + 1,
+            title: [ch.n, ch.e].filter(Boolean).join(': '),
+            url: `${BASE}/truyen/${slug}/${chSlug}/`,
+          });
+        }
+      } catch {
+        // skip failed range
+      }
+    }
+
+    // Sort by chapter number ascending
+    allStubs.sort((a, b) => a.number - b.number);
+
+    return { novel, chapterStubs: allStubs };
+  },
+
+  async fetchChapterContent(url) {
+    const html = await __http.get(url, this._headers);
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+
+    const title = doc.querySelector('h2')?.textContent.trim() ?? '';
+
+    // Extract pako-compressed content from inline script
+    const scriptEl = doc.querySelector('script#script-x');
+    if (!scriptEl) return { title, content: '' };
+
+    const scriptText = scriptEl.textContent ?? '';
+
+    // Extract the encoded data variable (const data_x = "...")
+    const dataMatch = scriptText.match(/(?:var|const)\s+data_x\s*=\s*"([^"]+)"/);
+    if (!dataMatch) return { title, content: '' };
+
+    const encoded = dataMatch[1];
+
+    // Custom alphabet substitution → standard base64
+    // c = custom alphabet used by site
+    // s = standard base64 alphabet
+    const c = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_';
+    const s = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    let translated = '';
+    for (const ch of encoded) {
+      const idx = c.indexOf(ch);
+      translated += idx > -1 ? s[idx] : ch;
+    }
+
+    // Decode base64 → Uint8Array → pako inflate
+    const bytes = Uint8Array.from(atob(translated), ch => ch.charCodeAt(0));
+    const inflated = pako.inflate(bytes, { to: 'string' });
+
+    // inflated is HTML — parse and extract text
+    const contentDoc = new DOMParser().parseFromString(inflated, 'text/html');
+    // Remove ads
+    contentDoc.querySelectorAll('[class^="aam-"], .aam-ad-container, [data-xads], .carousel').forEach(el => el.remove());
+
+    const PARA = '\x00';
+    const content = contentDoc.body.innerHTML
+      .replace(/<br\s*\/?>/gi, PARA)
+      .replace(/<[^>]+>/g, '')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .split(PARA)
+      .map(p => p.replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+      .join('\n');
+
+    return { title, content };
+  },
+})

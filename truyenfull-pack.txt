@@ -1,0 +1,117 @@
+({
+  domain: 'truyenfull.today',
+  displayName: 'Truyenfull',
+
+  async search(query, page) {
+    const encoded = encodeURIComponent(query).replace(/%20/g, '+');
+    const url = page === 1
+      ? `https://truyenfull.today/tim-kiem/?tukhoa=${encoded}`
+      : `https://truyenfull.today/tim-kiem/?tukhoa=${encoded}&page=${page}`;
+    const html = await __http.get(url);
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+
+    const results = [...doc.querySelectorAll('div.list.list-truyen div.row[itemscope]')]
+      .map(el => {
+        const anchor = el.querySelector('h3.truyen-title a');
+        const href = anchor?.getAttribute('href') ?? '';
+        if (!href) return null;
+        return {
+          id: href.replace(/^https?:\/\/truyenfull\.today\//, '').replace(/\/$/, '').split('/')[0],
+          title: anchor.textContent.trim(),
+          cover_url: el.querySelector('img.cover')?.getAttribute('src') ?? '',
+          source_url: href,
+        };
+      })
+      .filter(Boolean);
+
+    let totalPages = 1;
+    doc.querySelectorAll('ul.pagination li a').forEach(a => {
+      const m = a.getAttribute('href')?.match(/[?&]page=(\d+)/);
+      if (m) totalPages = Math.max(totalPages, parseInt(m[1], 10));
+    });
+
+    return { results, totalPages };
+  },
+
+  async fetchNovelDetail(slug) {
+    const BASE = 'https://truyenfull.today';
+    const html = await __http.get(`${BASE}/${slug}`);
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+
+    const novel = {
+      id: slug,
+      title: doc.querySelector('h3.title')?.textContent.trim() ?? '',
+      cover_url: doc.querySelector('img[itemprop="image"]')?.getAttribute('src') ?? '',
+      source_url: `${BASE}/${slug}`,
+      status: doc.querySelector('span.text-success') ? 'complete' : 'ongoing',
+      source_domain: 'truyenfull.today',
+    };
+
+    function parseStubs(d, s) {
+      return [...d.querySelectorAll('div#list-chapter a[href*="/chuong-"]')]
+        .map((a, i) => {
+          const href = a.getAttribute('href') ?? '';
+          if (!href) return null;
+          const m = href.match(/\/chuong-(\d+)\//);
+          return {
+            id: href.replace(/^https?:\/\/truyenfull\.today/, ''),
+            novel_id: s,
+            number: m ? parseInt(m[1], 10) : i + 1,
+            title: a.textContent.trim(),
+            url: href.startsWith('http') ? href : `${BASE}${href}`,
+          };
+        })
+        .filter(Boolean);
+    }
+
+    let totalPages = 1;
+    doc.querySelectorAll('ul.pagination li a').forEach(a => {
+      const m = a.getAttribute('href')?.match(/\/trang-(\d+)\//);
+      if (m) totalPages = Math.max(totalPages, parseInt(m[1], 10));
+    });
+
+    const firstStubs = parseStubs(doc, slug);
+    const seen = new Set(firstStubs.map(s => s.id));
+    const allStubs = [...firstStubs];
+
+    for (let page = 2; page <= totalPages; page++) {
+      try {
+        const pageHtml = await __http.get(`${BASE}/${slug}/trang-${page}/`);
+        const pageDoc = new DOMParser().parseFromString(pageHtml, 'text/html');
+        parseStubs(pageDoc, slug)
+          .filter(s => !seen.has(s.id))
+          .forEach(s => { seen.add(s.id); allStubs.push(s); });
+        await new Promise(r => setTimeout(r, 200));
+      } catch {
+        break;
+      }
+    }
+
+    return { novel, chapterStubs: allStubs };
+  },
+
+  async fetchChapterContent(url) {
+    const html = await __http.get(url);
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+
+    const title = doc.querySelector('a.chapter-title')?.textContent.trim() ?? '';
+
+    const contentEl = doc.querySelector('div#chapter-c');
+    contentEl?.querySelector('div#ads-chapter-top')?.remove();
+
+    const PARA = '\x00';
+    const content = (contentEl?.innerHTML ?? '')
+      .replace(/<br\s*\/?>/gi, PARA)
+      .replace(/<[^>]+>/g, '')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .split(PARA)
+      .map(p => p.replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+      .join('\n');
+
+    return { title, content };
+  },
+})
